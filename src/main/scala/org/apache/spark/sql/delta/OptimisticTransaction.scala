@@ -23,7 +23,6 @@ import java.util.concurrent.TimeUnit.NANOSECONDS
 import scala.collection.mutable
 import scala.collection.mutable.{ArrayBuffer, HashSet}
 import scala.util.control.NonFatal
-
 import com.databricks.spark.util.TagDefinitions.TAG_LOG_STORE_CLASS
 import org.apache.spark.sql.delta.DeltaOperations.Operation
 import org.apache.spark.sql.delta.actions._
@@ -33,12 +32,16 @@ import org.apache.spark.sql.delta.metering.DeltaLogging
 import org.apache.spark.sql.delta.schema.SchemaUtils
 import org.apache.spark.sql.delta.sources.DeltaSQLConf
 import org.apache.hadoop.fs.Path
-
 import org.apache.spark.internal.Logging
-import org.apache.spark.sql.{AnalysisException, SparkSession}
+import org.apache.spark.sql.{AnalysisException, Dataset, Row, SparkSession}
 import org.apache.spark.sql.catalyst.expressions._
+import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
+import org.apache.spark.sql.delta.stats.DeltaScan
+import org.apache.spark.sql.delta.util.DeltaBloomFilter.getDeltaIDCols
+import org.apache.spark.sql.delta.util.{BFItem, DeltaBloomFilter}
 import org.apache.spark.sql.execution.datasources.parquet.ParquetSchemaConverter
 import org.apache.spark.util.{Clock, Utils}
+import org.apache.spark.sql.functions._
 
 /** Record metrics about a successful commit. */
 case class CommitStats(
@@ -78,10 +81,10 @@ case class CommitStats(
  * @param snapshot The snapshot that this transaction is reading at.
  */
 class OptimisticTransaction
-    (override val deltaLog: DeltaLog, override val snapshot: Snapshot)
-    (implicit override val clock: Clock)
+(override val deltaLog: DeltaLog, override val snapshot: Snapshot)
+  (implicit override val clock: Clock)
   extends OptimisticTransactionImpl
-  with DeltaLogging {
+    with DeltaLogging {
 
   /** Creates a new OptimisticTransaction.
    *
@@ -246,6 +249,69 @@ trait OptimisticTransactionImpl extends TransactionalWrite with SQLMetricsReport
     scan.files
   }
 
+  def updateMetadata(configuration: Map[String, String]): Unit = {
+    newMetadata = Some(metadata.copy(configuration = configuration))
+  }
+
+  /** Filter files by bloom filter */
+  def filterByBloomFilter(files: Seq[AddFile], source: LogicalPlan = null): Seq[AddFile] = {
+    val addFiles =
+      if (source != null && DeltaBloomFilter.checkBloomFilterIfExist(deltaLog)) {
+        val bfLocation = DeltaConfigs.BLOOM_FILTER_LOCATION.fromMetaData(deltaLog.snapshot.metadata)
+        try {
+          val bfPath = new Path(deltaLog.dataPath.toUri.getPath, bfLocation)
+          val idCols = getDeltaIDCols(deltaLog)
+          val sourceDF = Dataset.ofRows(spark, source)
+          import _spark.implicits._
+          val sourceIdCols = sourceDF.select(idCols.map(col): _*)
+          val name2Index = DeltaBloomFilter.getNameIndexFromSchema(sourceIdCols.schema)
+
+          val dataBr = spark.sparkContext.broadcast(sourceIdCols.collect())
+          val affectedFilePaths = spark.read.parquet(bfPath.toUri.getPath).as[BFItem]
+            .flatMap { bfItem: BFItem =>
+              val bf = DeltaBloomFilter(bfItem.bf)
+              val dataInBf =
+                dataBr.value.exists {
+                  row: Row =>
+                    val key = DeltaBloomFilter.makeBFKey(idCols, row, name2Index)
+                    bf.mightContain(key)
+                }
+              if (dataInBf) List(bfItem.fileName) else List()
+            }
+            .as[String]
+            .collect()
+            .toSet
+          val (affectedAddFiles, noneAffectedAddFiles) =
+            files.partition(x => affectedFilePaths.contains(x.path))
+          readFiles --= noneAffectedAddFiles
+          affectedAddFiles
+        } catch {
+          case e: Throwable =>
+            logWarning(e.getMessage, e)
+            e.printStackTrace()
+            files
+        }
+      } else {
+        val bfLocation =
+          DeltaConfigs.BLOOM_FILTER_LOCATION.fromMetaData(deltaLog.snapshot.metadata)
+        logWarning(s"source: ${source != null}," +
+          s" bloom filter file: $bfLocation, version: ${deltaLog.snapshot.version}")
+        files
+      }
+    optimizationBFOnlyAppend(addFiles)
+  }
+
+  /** if bloom filter touch add files is empty, we should find the smallest
+   * add files for merge data, otherwise files will be explode */
+  def optimizationBFOnlyAppend(files: Seq[AddFile]): Seq[AddFile] = {
+    if (files.isEmpty) {
+      val allFiles = deltaLog.snapshot.allFiles.collect()
+      val seq = allFiles.sortBy(_.size).headOption.toSeq
+      logInfo(s"add files is empty, pick $seq for optimization files num")
+      seq
+    } else files
+  }
+
   /** Mark the entire table as tainted by this transaction. */
   def readWholeTable(): Unit = {
     readPredicates += Literal(true)
@@ -286,13 +352,13 @@ trait OptimisticTransactionImpl extends TransactionalWrite with SQLMetricsReport
    * the given `lastVersion`.  In the case of a conflict with a concurrent writer this
    * method will throw an exception.
    *
-   * @param actions     Set of actions to commit
-   * @param op          Details of operation that is performing this transactional commit
+   * @param actions Set of actions to commit
+   * @param op      Details of operation that is performing this transactional commit
    */
   @throws(classOf[ConcurrentModificationException])
   def commit(actions: Seq[Action], op: DeltaOperations.Operation): Long = recordDeltaOperation(
-      deltaLog,
-      "delta.commit") {
+    deltaLog,
+    "delta.commit") {
     commitStartNano = System.nanoTime()
 
     val version = try {
@@ -361,8 +427,8 @@ trait OptimisticTransactionImpl extends TransactionalWrite with SQLMetricsReport
    * @return The finalized set of actions.
    */
   protected def prepareCommit(
-      actions: Seq[Action],
-      op: DeltaOperations.Operation): Seq[Action] = {
+    actions: Seq[Action],
+    op: DeltaOperations.Operation): Seq[Action] = {
 
     assert(!committed, "Transaction already committed.")
 
@@ -392,8 +458,8 @@ trait OptimisticTransactionImpl extends TransactionalWrite with SQLMetricsReport
         }
         logWarning(
           s"""
-            |Detected no metadata in initial commit but commit validation was turned off. To turn
-            |it back on set ${DeltaSQLConf.DELTA_COMMIT_VALIDATION_ENABLED} to "true"
+             |Detected no metadata in initial commit but commit validation was turned off. To turn
+             |it back on set ${DeltaSQLConf.DELTA_COMMIT_VALIDATION_ENABLED} to "true"
           """.stripMargin)
       }
     }
@@ -539,13 +605,13 @@ trait OptimisticTransactionImpl extends TransactionalWrite with SQLMetricsReport
    * otherwise, throw an exception.
    */
   protected def checkAndRetry(
-      checkVersion: Long,
-      actions: Seq[Action],
-      attemptNumber: Int,
-      commitIsolationLevel: IsolationLevel): Long = recordDeltaOperation(
-        deltaLog,
-        "delta.commit.retry",
-        tags = Map(TAG_LOG_STORE_CLASS -> deltaLog.store.getClass.getName)) {
+    checkVersion: Long,
+    actions: Seq[Action],
+    attemptNumber: Int,
+    commitIsolationLevel: IsolationLevel): Long = recordDeltaOperation(
+    deltaLog,
+    "delta.commit.retry",
+    tags = Map(TAG_LOG_STORE_CLASS -> deltaLog.store.getClass.getName)) {
 
     import _spark.implicits._
 

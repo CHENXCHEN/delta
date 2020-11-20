@@ -20,8 +20,9 @@ package org.apache.spark.sql.delta.commands
 import org.apache.spark.sql.delta._
 import org.apache.spark.sql.delta.actions.{Action, AddFile}
 import org.apache.spark.sql.delta.schema.ImplicitMetadataOperation
-
 import org.apache.spark.sql._
+import org.apache.spark.sql.delta.sources.DeltaSQLConf
+import org.apache.spark.sql.delta.util.DeltaBloomFilter
 import org.apache.spark.sql.execution.command.RunnableCommand
 
 /**
@@ -60,6 +61,9 @@ case class WriteIntoDelta(
   override protected val canOverwriteSchema: Boolean =
     options.canOverwriteSchema && isOverwriteOperation && options.replaceWhere.isEmpty
 
+  lazy val enableBloomFilter: Boolean = conf.getConf(DeltaSQLConf.DELTA_BLOOM_FILTER_ENABLE) ||
+    DeltaConfigs.ENABLE_BLOOM_FILTER.fromMetaData(deltaLog.snapshot.metadata)
+
   override def run(sparkSession: SparkSession): Seq[Row] = {
     deltaLog.withNewTransaction { txn =>
       val actions = write(txn, sparkSession)
@@ -84,6 +88,12 @@ case class WriteIntoDelta(
     }
     val rearrangeOnly = options.rearrangeOnly
     updateMetadata(txn, data, partitionColumns, configuration, isOverwriteOperation, rearrangeOnly)
+
+    if (enableBloomFilter) {
+      txn.updateMetadata(
+        DeltaBloomFilter.addBFConfiguration(txn.metadata.configuration, txn.deltaLog)
+      )
+    }
 
     // Validate partition predicates
     val replaceWhere = options.replaceWhere
@@ -124,11 +134,16 @@ case class WriteIntoDelta(
       case _ => Nil
     }
 
-    if (rearrangeOnly) {
+    val deltaActions = if (rearrangeOnly) {
       newFiles.map(_.copy(dataChange = !rearrangeOnly)) ++
         deletedFiles.map(_.copy(dataChange = !rearrangeOnly))
     } else {
       newFiles ++ deletedFiles
     }
+    if (enableBloomFilter) {
+      DeltaBloomFilter.generateBloomFilterFile(sparkSession, deltaLog, txn
+        , deltaActions, data.schema)
+    }
+    deltaActions
   }
 }

@@ -16,29 +16,26 @@
 
 package org.apache.spark.sql.delta.commands
 
-import scala.collection.JavaConverters._
-
-import org.apache.spark.sql.delta._
-import org.apache.spark.sql.delta.actions.AddFile
-import org.apache.spark.sql.delta.files._
-import org.apache.spark.sql.delta.schema.ImplicitMetadataOperation
-import org.apache.spark.sql.delta.sources.DeltaSQLConf
-import org.apache.spark.sql.delta.util.{AnalysisHelper, SetAccumulator}
-
 import org.apache.spark.SparkContext
 import org.apache.spark.sql._
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.encoders.{ExpressionEncoder, RowEncoder}
-import org.apache.spark.sql.catalyst.expressions.{Alias, Attribute, AttributeReference, Expression, Literal, PredicateHelper, UnsafeProjection}
-import org.apache.spark.sql.catalyst.expressions.BasePredicate
-import org.apache.spark.sql.catalyst.expressions.NamedExpression
 import org.apache.spark.sql.catalyst.expressions.codegen._
+import org.apache.spark.sql.catalyst.expressions.{Alias, Attribute, AttributeReference, BasePredicate, Expression, Literal, NamedExpression, PredicateHelper, UnsafeProjection}
 import org.apache.spark.sql.catalyst.plans.logical._
+import org.apache.spark.sql.delta._
+import org.apache.spark.sql.delta.actions.{AddFile, FileAction}
+import org.apache.spark.sql.delta.files._
+import org.apache.spark.sql.delta.schema.ImplicitMetadataOperation
+import org.apache.spark.sql.delta.sources.DeltaSQLConf
+import org.apache.spark.sql.delta.util.{AnalysisHelper, DeltaBloomFilter, SetAccumulator}
 import org.apache.spark.sql.execution.SQLExecution
 import org.apache.spark.sql.execution.command.RunnableCommand
 import org.apache.spark.sql.execution.metric.{SQLMetric, SQLMetrics}
 import org.apache.spark.sql.functions._
-import org.apache.spark.sql.types.{StructField, StructType}
+import org.apache.spark.sql.types.StructType
+
+import scala.collection.JavaConverters._
 
 case class MergeDataRows(rows: Long)
 case class MergeDataFiles(files: Long)
@@ -106,6 +103,8 @@ case class MergeIntoCommand(
 
   override val canMergeSchema: Boolean = conf.getConf(DeltaSQLConf.DELTA_SCHEMA_AUTO_MIGRATE)
   override val canOverwriteSchema: Boolean = false
+  lazy val enableBloomFilter: Boolean = conf.getConf(DeltaSQLConf.DELTA_BLOOM_FILTER_ENABLE) ||
+    DeltaConfigs.ENABLE_BLOOM_FILTER.fromMetaData(targetDeltaLog.snapshot.metadata)
 
   @transient private lazy val sc: SparkContext = SparkContext.getOrCreate()
   @transient private lazy val targetDeltaLog: DeltaLog = targetFileIndex.deltaLog
@@ -145,6 +144,12 @@ case class MergeIntoCommand(
           isOverwriteMode = false, rearrangeOnly = false)
       }
 
+      if (enableBloomFilter) {
+        deltaTxn.updateMetadata(
+          DeltaBloomFilter.addBFConfiguration(deltaTxn.metadata.configuration, deltaTxn.deltaLog)
+        )
+      }
+
       val deltaActions = {
        if (isInsertOnly && spark.conf.get(DeltaSQLConf.MERGE_INSERT_ONLY_ENABLED)) {
          writeInsertsOnlyWhenNoMatchedClauses(spark, deltaTxn)
@@ -158,6 +163,12 @@ case class MergeIntoCommand(
        }
       }
       deltaTxn.registerSQLMetrics(spark, metrics)
+
+      if (enableBloomFilter) {
+        DeltaBloomFilter.generateBloomFilterFile(spark, targetDeltaLog
+          , deltaTxn, deltaActions, source.schema)
+      }
+
       deltaTxn.commit(
         deltaActions,
         DeltaOperations.Merge(
@@ -223,7 +234,11 @@ case class MergeIntoCommand(
     // Skip data based on the merge condition
     val targetOnlyPredicates =
       splitConjunctivePredicates(condition).filter(_.references.subsetOf(target.outputSet))
-    val dataSkippedFiles = deltaTxn.filterFiles(targetOnlyPredicates)
+    var dataSkippedFiles = deltaTxn.filterFiles(targetOnlyPredicates)
+
+    if (enableBloomFilter) {
+      dataSkippedFiles = deltaTxn.filterByBloomFilter(dataSkippedFiles, source)
+    }
 
     // Apply inner join to between source and target using the merge condition to find matches
     // In addition, we attach two columns
@@ -410,9 +425,15 @@ case class MergeIntoCommand(
       Dataset.ofRows(spark, joinedPlan).mapPartitions(processor.processPartition)(outputRowEncoder)
     logDebug("writeAllChanges: join output plan:\n" + outputDF.queryExecution)
 
+    // If we need rewrite these files,
+    // we should try our best to ensure that the number of files will not explode.
+    val repartitionNum: Int = filesToRewrite.length max 1
     // Write to Delta
     val newFiles = deltaTxn
-      .writeFiles(repartitionIfNeeded(spark, outputDF, deltaTxn.metadata.partitionColumns))
+      .writeFiles(
+        repartitionIfNeeded(spark, outputDF, deltaTxn.metadata.partitionColumns
+          , Some(repartitionNum))
+      )
     metrics("numTargetFilesAdded") += newFiles.size
     newFiles
   }
@@ -465,13 +486,20 @@ case class MergeIntoCommand(
    * and `merge.repartitionBeforeWrite.enabled` is set to true.
    */
   protected def repartitionIfNeeded(
-      spark: SparkSession,
-      df: DataFrame,
-      partitionColumns: Seq[String]): DataFrame = {
+    spark: SparkSession,
+    df: DataFrame,
+    partitionColumns: Seq[String],
+    numPartition: Option[Int] = Option.empty): DataFrame = {
     if (partitionColumns.nonEmpty && spark.conf.get(DeltaSQLConf.MERGE_REPARTITION_BEFORE_WRITE)) {
-      df.repartition(partitionColumns.map(col): _*)
+      numPartition match {
+        case Some(num) => df.repartition(num, partitionColumns.map(col): _*)
+        case _ => df.repartition(partitionColumns.map(col): _*)
+      }
     } else {
-      df
+      numPartition match {
+        case Some(num) => df.repartition(num)
+        case _ => df
+      }
     }
   }
 }

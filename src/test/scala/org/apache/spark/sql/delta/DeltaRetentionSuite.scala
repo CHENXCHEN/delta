@@ -19,11 +19,12 @@ package org.apache.spark.sql.delta
 import java.io.File
 
 import org.apache.spark.sql.delta.actions.{Action, AddFile, RemoveFile}
-import org.apache.spark.sql.delta.util.FileNames
+import org.apache.spark.sql.delta.util.{BFItem, DeltaBloomFilter, FileNames}
 import org.apache.hadoop.fs.Path
 
 import org.apache.spark.SparkConf
-import org.apache.spark.sql.QueryTest
+import org.apache.spark.sql.{QueryTest, SaveMode}
+import org.apache.spark.sql.delta.sources.DeltaSQLConf
 import org.apache.spark.sql.test.SQLTestUtils
 import org.apache.spark.util.ManualClock
 
@@ -184,6 +185,73 @@ class DeltaRetentionSuite extends QueryTest with DeltaRetentionSuiteBase with SQ
       val afterCleanup = getLogFiles(logPath)
       initialFiles.foreach { file =>
         assert(!afterCleanup.contains(file))
+      }
+    }
+  }
+
+  def getBloomFilterFiles(dir: File): Seq[File] = dir.listFiles()
+
+  test("delete expired bloom filter files") {
+    withSQLConf(DeltaSQLConf.DELTA_BLOOM_FILTER_ENABLE.key -> "true"
+      , DeltaSQLConf.DELTA_ID_COLS.key -> "id") {
+      withTempDir { tempDir =>
+        val clock = new ManualClock(System.currentTimeMillis())
+        val log = DeltaLog.forTable(spark, new Path(tempDir.getCanonicalPath), clock)
+        val logPath = new File(log.logPath.toUri)
+        val bloomFilterPath = new File(new Path(log.dataPath, FileNames.bloomFilterDirPrefix).toUri)
+        val sparkSession = spark
+        import sparkSession.implicits._
+        (1 to 5).foreach { i =>
+          Seq(BFItem(i.toString, "", 0, "")).toDF.coalesce(1)
+            .write
+            .mode(SaveMode.Overwrite)
+            .parquet(new Path(log.dataPath, DeltaBloomFilter.getBloomFilterPath(i)).toUri.getPath)
+
+          val txn = if (i == 1) startTxnWithManualLogCleanup(log) else log.startTransaction()
+          val file = AddFile(i.toString, Map.empty, 1, 1, true) :: Nil
+          val delete: Seq[Action] = if (i > 1) {
+            RemoveFile(i - 1 toString, Some(System.currentTimeMillis()), true) :: Nil
+          } else {
+            Nil
+          }
+          txn.commit(delete ++ file, testOp)
+        }
+
+        val initialBFiles = getBloomFilterFiles(bloomFilterPath)
+        val initialFiles = getLogFiles(logPath)
+        // Shouldn't clean up, no checkpoint, no expired files
+        log.cleanUpExpiredLogs()
+
+        assert(initialFiles === getLogFiles(logPath))
+        assert(initialBFiles == getBloomFilterFiles(bloomFilterPath))
+
+        clock.advance(intervalStringToMillis(DeltaConfigs.LOG_RETENTION.defaultValue) +
+          intervalStringToMillis("interval 1 day"))
+
+        // Shouldn't clean up, no checkpoint, although all files have expired
+        log.cleanUpExpiredLogs()
+        assert(initialFiles === getLogFiles(logPath))
+        assert(initialBFiles == getBloomFilterFiles(bloomFilterPath))
+
+        log.checkpoint()
+
+        val expectedFiles = Seq("04.json", "04.checkpoint.parquet")
+        // after checkpointing, the files should be cleared
+        log.cleanUpExpiredLogs()
+        val afterCleanup = getLogFiles(logPath)
+        assert(initialFiles !== afterCleanup)
+        assert(expectedFiles.forall(suffix => afterCleanup.exists(_.getName.endsWith(suffix))),
+          s"${afterCleanup.mkString("\n")}\n didn't contain files with suffixes: $expectedFiles")
+
+        val afterBFCleanup = getBloomFilterFiles(bloomFilterPath)
+        val expectedBFFiles = Seq(FileNames.bloomFilterPrefix(log.dataPath, 4)
+          , FileNames.bloomFilterPrefix(log.dataPath, 5)).map(_.toUri.getPath)
+
+        assert(initialBFiles !== afterBFCleanup)
+        assert(expectedBFFiles.forall(prefix =>
+          afterBFCleanup.exists(_.toURI.getPath.startsWith(prefix))),
+          s"${expectedBFFiles.mkString("\n")}\n " +
+            s"didn't contain bloom filter files with prefixes: $expectedBFFiles")
       }
     }
   }

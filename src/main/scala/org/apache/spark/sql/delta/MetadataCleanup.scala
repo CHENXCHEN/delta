@@ -16,12 +16,15 @@
 
 package org.apache.spark.sql.delta
 
+import java.io.FileNotFoundException
 import java.util.{Calendar, TimeZone}
 
 import org.apache.spark.sql.delta.DeltaHistoryManager.BufferingLogDeletionIterator
 import org.apache.spark.sql.delta.metering.DeltaLogging
 import org.apache.commons.lang3.time.DateUtils
 import org.apache.hadoop.fs.{FileStatus, Path}
+
+import org.apache.spark.sql.delta.util.FileNames._
 
 /** Cleans up expired Delta table metadata. */
 trait MetadataCleanup extends DeltaLogging {
@@ -51,15 +54,26 @@ trait MetadataCleanup extends DeltaLogging {
     recordDeltaOperation(this, "delta.log.cleanup") {
       val fileCutOffTime = truncateDay(clock.getTimeMillis() - deltaRetentionMillis).getTime
       val formattedDate = fileCutOffTime.toGMTString
-      logInfo(s"Starting the deletion of log files older than $formattedDate")
 
-      var numDeleted = 0
-      listExpiredDeltaLogs(fileCutOffTime.getTime).map(_.getPath).foreach { path =>
-        // recursive = false
-        if (fs.delete(path, false)) numDeleted += 1
-      }
+      logInfo(s"Starting the deletion of log files older than $formattedDate")
+      val numDeleted = cleanUpExpireFile(listExpiredDeltaLogs(fileCutOffTime.getTime))
       logInfo(s"Deleted $numDeleted log files older than $formattedDate")
+
+      logInfo(s"Starting the deletion of bloom filter files older than $formattedDate")
+      val bloomFilterNumDeleted = cleanUpExpireFile(listExpiredBloomFilters(fileCutOffTime.getTime)
+        , true)
+      logInfo(s"Deleted $bloomFilterNumDeleted bloom filter files older than $formattedDate")
     }
+  }
+
+  /** Clean up expired files */
+  private[delta] def cleanUpExpireFile(iterator: Iterator[FileStatus]
+    , recursive: Boolean = false): Int = {
+    iterator.map(_.getPath).map { path =>
+      // recursive = false
+      if (fs.delete(path, recursive)) 1
+      else 0
+    }.sum
   }
 
   /**
@@ -69,8 +83,6 @@ trait MetadataCleanup extends DeltaLogging {
    *  - be older than `fileCutOffTime`
    */
   private def listExpiredDeltaLogs(fileCutOffTime: Long): Iterator[FileStatus] = {
-    import org.apache.spark.sql.delta.util.FileNames._
-
     val latestCheckpoint = lastCheckpoint
     if (latestCheckpoint.isEmpty) return Iterator.empty
     val threshold = latestCheckpoint.get.version - 1L
@@ -85,6 +97,24 @@ trait MetadataCleanup extends DeltaLogging {
     }
 
     new BufferingLogDeletionIterator(files, fileCutOffTime, threshold, getVersion)
+  }
+
+  private def listExpiredBloomFilters(fileCutOffTime: Long): Iterator[FileStatus] = {
+    val latestCheckpoint = lastCheckpoint
+    if (latestCheckpoint.isEmpty) return Iterator.empty
+    val threshold = latestCheckpoint.get.version - 1L
+    try {
+      val files = store.listFrom(bloomFilterPrefix(dataPath, 0))
+        .filter(f => isBloomFilterFile(f.getPath))
+      def getVersion(filePath: Path): Long = {
+        filePath.getName.split("_")(0).toLong
+      }
+
+      new BufferingLogDeletionIterator(files, fileCutOffTime, threshold, getVersion)
+    } catch {
+      case _: FileNotFoundException => Iterator.empty
+      case e: Throwable => throw e
+    }
   }
 
   /** Truncates a timestamp down to the previous midnight and returns the time and a log string */

@@ -21,8 +21,15 @@ import java.util.Locale
 import org.apache.spark.sql.delta.sources.DeltaSQLConf
 import org.apache.spark.sql.delta.test.DeltaSQLCommandTest
 import io.delta.tables._
+import org.apache.hadoop.fs.Path
+import org.scalatest.Assertion
 
 import org.apache.spark.sql._
+import org.apache.spark.sql.delta.DeltaConfigs._
+import org.apache.spark.sql.delta.catalog.DeltaTableV2
+import org.apache.spark.sql.delta.commands.AlterTableSetPropertiesDeltaCommand
+import org.apache.spark.sql.delta.util.DeltaBloomFilter
+import org.apache.spark.sql.functions.input_file_name
 import org.apache.spark.sql.types.StructType
 
 class MergeIntoScalaSuite extends MergeIntoSuiteBase  with DeltaSQLCommandTest {
@@ -514,5 +521,182 @@ class MergeIntoScalaSuite extends MergeIntoSuiteBase  with DeltaSQLCommandTest {
     if (nameOrPath.startsWith("delta.`")) {
       nameOrPath.stripPrefix("delta.`").stripSuffix("`")
     } else nameOrPath
+  }
+
+  val defaultDeltaConf: Map[DeltaConfig[_], Any] = Map(
+    LOG_RETENTION -> "interval 5 days"
+    , CHECKPOINT_INTERVAL -> 10
+    , ENABLE_EXPIRED_LOG_CLEANUP -> true
+    , TOMBSTONE_RETENTION -> "interval 1 week"
+    , AUTO_OPTIMIZE -> true
+    , SYMLINK_FORMAT_MANIFEST_ENABLED -> true
+    , DATA_SKIPPING_NUM_INDEXED_COLS -> -1
+    , ENABLE_BLOOM_FILTER -> true
+    , ID_COLS -> "id"
+  )
+  val FILE_NAME = "__fileName__"
+
+  def getDeltaConf: Map[String, String] = {
+    defaultDeltaConf.map {
+      case (kk, vv) => kk.key -> vv.toString
+    }
+  }
+
+  def getBloomFilterDF(deltaLog: DeltaLog): DataFrame = {
+    val bfPath = new Path(
+      deltaLog.dataPath
+      , DeltaConfigs.BLOOM_FILTER_LOCATION.fromMetaData(deltaLog.snapshot.metadata)
+    )
+    spark.read.format("parquet")
+      .load(bfPath.toUri.getPath)
+  }
+
+
+  def compareAndGetDeltaFilesAndBloomFiles(): Int = {
+    val deltaLog = DeltaLog.forTable(spark, tempPath)
+    val dataFrame = readDeltaTable(tempPath)
+      .withColumn(FILE_NAME, input_file_name())
+    val dataFiles = dataFrame.select(FILE_NAME).distinct().collect()
+      .map(x => new Path(x.getAs[String](FILE_NAME)).getName).toSeq.sorted
+    val bfDF = getBloomFilterDF(deltaLog)
+    bfDF.show()
+    val bloomFiles = bfDF.select("fileName").collect()
+      .map(x => new Path(x.getAs[String]("fileName")).getName).toSeq.sorted
+    assert(bloomFiles == dataFiles, s"bloom files $bloomFiles expect data files $dataFiles")
+    dataFiles.length
+  }
+
+  def checkDeltaBloomProperties(): Unit = {
+    val deltaLog = DeltaLog.forTable(spark, tempPath)
+    assert(DeltaBloomFilter.checkBloomFilterIfExist(deltaLog),
+      s"bloom filter ${BLOOM_FILTER_LOCATION.fromMetaData(deltaLog.snapshot.metadata)} " +
+        s"no match with version ${deltaLog.snapshot.version}")
+    assert(DeltaConfigs.ID_COLS.fromMetaData(deltaLog.snapshot.metadata) == Seq("id")
+      , "idCols should be update!")
+  }
+
+  test("bloom filter no config - scala API") {
+    withTable("source") {
+      append(Seq((1, "spark"), (2, "hadoop"),
+        (3, "hdfs"), (4, "hive"), (5, "dfs")).toDF("id", "name"))
+      var deltaLog = DeltaLog.forTable(spark, tempPath)
+      assert(!DeltaBloomFilter.checkBloomFilterIfExist(deltaLog),
+        s"bloom filter should not exist, " +
+            s"expect ${BLOOM_FILTER_LOCATION.fromMetaData(deltaLog.snapshot.metadata)}")
+
+      val deltaTableV2: DeltaTableV2 = DeltaTableV2(spark, new Path(tempPath))
+      AlterTableSetPropertiesDeltaCommand(deltaTableV2, getDeltaConf).run(spark)
+
+      spark.read.format("delta").load(tempPath).repartition(2)
+          .write
+          .option("dataChange", "false")
+          .format("delta")
+          .mode("overwrite")
+          .save(tempPath)
+
+      checkDeltaBloomProperties()
+      compareAndGetDeltaFilesAndBloomFiles()
+    }
+  }
+
+  test("bloom filter config - scala API") {
+    withTable("source") {
+      withSQLConf(DeltaSQLConf.DELTA_BLOOM_FILTER_ENABLE.key -> "true"
+        , DeltaSQLConf.DELTA_ID_COLS.key -> "id") {
+        append(Seq((1, "spark"), (2, "hadoop"),
+          (3, "hdfs"), (4, "hive"), (5, "dfs"), (6, "fs")).toDF("id", "name")
+            .repartition(3))
+
+        var deltaLog = DeltaLog.forTable(spark, tempPath)
+
+        checkDeltaBloomProperties()
+        compareAndGetDeltaFilesAndBloomFiles()
+
+
+        var bfDF = getBloomFilterDF(deltaLog)
+        logConsole(s"bloom filter file: ")
+        bfDF.show(false)
+
+        val df = readDeltaTable(tempPath)
+            .withColumn(FILE_NAME, input_file_name)
+
+        df.show(false)
+
+        checkDeltaBloomProperties()
+        assert(compareAndGetDeltaFilesAndBloomFiles() == 3
+          , "file num should be 3 after repartition write")
+
+        val source = Seq((1, "chc"), (3, ""), (7, "")).toDF("id", "name")  // source
+        io.delta.tables.DeltaTable.forPath(spark, tempPath).as("t")
+            .merge(source.as("s"), "s.id = t.id")
+            .whenMatched("s.id = 2").delete()
+            .whenMatched().updateAll()
+            .whenNotMatched().insertAll()
+            .execute()
+
+        deltaLog = DeltaLog.forTable(spark, tempPath)
+        bfDF = getBloomFilterDF(deltaLog)
+        logConsole(s"bloom filter file: ")
+        bfDF.show(false)
+
+        val dataFrame = readDeltaTable(tempPath)
+            .withColumn(FILE_NAME, input_file_name())
+        dataFrame.show(false)
+
+        checkDeltaBloomProperties()
+        assert(compareAndGetDeltaFilesAndBloomFiles() == 3
+          , "file num should be balance with delete update insert")
+
+        val sourceOnlyDelete = Seq((2, "ddd"), (5, ""), (7, "")).toDF("id", "name")
+        io.delta.tables.DeltaTable.forPath(spark, tempPath).as("t")
+            .merge(sourceOnlyDelete.as("s"), "s.id = t.id")
+            .whenMatched().delete()
+            .execute()
+
+        deltaLog = DeltaLog.forTable(spark, tempPath)
+        bfDF = getBloomFilterDF(deltaLog)
+        logConsole(s"bloom filter file: ")
+        bfDF.show(false)
+
+        val dataFrameDeleted = readDeltaTable(tempPath)
+            .withColumn(FILE_NAME, input_file_name())
+        dataFrameDeleted.show(false)
+
+        checkDeltaBloomProperties()
+        assert(compareAndGetDeltaFilesAndBloomFiles() == 1
+          , "file num should be decrease when delete")
+
+        val sourceOnlyAdd = Seq((3, "ddd"), (5, ""), (4, "")).toDF("id", "name")
+        io.delta.tables.DeltaTable.forPath(spark, tempPath).as("t")
+            .merge(sourceOnlyAdd.as("s"), "s.id = t.id")
+            .whenMatched().updateAll()
+            .whenNotMatched().insertAll()
+            .execute()
+
+        deltaLog = DeltaLog.forTable(spark, tempPath)
+        bfDF = getBloomFilterDF(deltaLog)
+        logConsole(s"bloom filter file: ")
+        bfDF.show(false)
+
+        val dataFrameAdded = readDeltaTable(tempPath)
+            .withColumn(FILE_NAME, input_file_name())
+        dataFrameAdded.show(false)
+
+        checkDeltaBloomProperties()
+        assert(compareAndGetDeltaFilesAndBloomFiles() == 1
+          , "data only append, file num should not be increase")
+
+        checkAnswer(
+          dataFrameAdded.drop(FILE_NAME),
+          Seq(
+            Row(3, "ddd")
+            , Row(5, "")
+            , Row(4, "")
+            , Row(1, "chc")
+            , Row(6, "fs")
+          )
+        )
+      }
+    }
   }
 }

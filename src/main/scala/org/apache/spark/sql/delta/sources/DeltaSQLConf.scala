@@ -296,4 +296,20 @@ object DeltaSQLConf {
         """.stripMargin)
       .booleanConf
       .createWithDefault(true)
+
+  val DELTA_BLOOM_FILTER_ENABLE =
+    buildConf("bloomFilter.enabled")
+      .internal()
+      .doc(
+        """If true, bloom filter will be used""".stripMargin)
+      .booleanConf
+      .createWithDefault(false)
+
+  val DELTA_ID_COLS =
+    buildConf("idCols")
+      .internal()
+      .doc(
+        """If true, bloom filter will be used""".stripMargin)
+      .stringConf
+      .createOptional
 }

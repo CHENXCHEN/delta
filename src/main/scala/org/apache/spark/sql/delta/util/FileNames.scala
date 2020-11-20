@@ -25,6 +25,7 @@ object FileNames {
   val deltaFilePattern = "\\d+\\.json".r.pattern
   val checksumFilePattern = "\\d+\\.crc".r.pattern
   val checkpointFilePattern = "\\d+\\.checkpoint(\\.\\d+\\.\\d+)?\\.parquet".r.pattern
+  val bloomFilterPatter = "\\d+_[0-9a-z\\-]+".r.pattern
 
   /** Returns the path for a given delta file. */
   def deltaFile(path: Path, version: Long): Path = new Path(path, f"$version%020d.json")
@@ -105,4 +106,22 @@ object FileNames {
       // scalastyle:on throwerror
     }
   }
+
+  val bloomFilterDirPrefix: String = "_index/_bf_index/"
+
+  def isBloomFilterFile(path: Path): Boolean = {
+    path.getParent.toUri.getPath.endsWith(s"$bloomFilterDirPrefix".stripSuffix("/")) &&
+      bloomFilterPatter.matcher(path.getName).matches()
+  }
+
+  /**
+   * return the child path for bloom filter file
+   */
+  def bloomFilterChildPrefix(version: Long): String = f"$bloomFilterDirPrefix%s$version%020d_"
+
+  /**
+   * return the prefix path for bloom filter file
+   */
+  def bloomFilterPrefix(path: Path, version: Long): Path =
+    new Path(path, bloomFilterChildPrefix(version))
 }

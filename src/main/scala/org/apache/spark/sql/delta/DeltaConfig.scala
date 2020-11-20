@@ -18,11 +18,10 @@ package org.apache.spark.sql.delta
 
 import java.util.{HashMap, Locale}
 
-import org.apache.spark.sql.delta.actions.{Metadata, Protocol}
-import org.apache.spark.sql.delta.metering.DeltaLogging
-
 import org.apache.spark.sql.AnalysisException
 import org.apache.spark.sql.catalyst.util.{DateTimeConstants, IntervalUtils}
+import org.apache.spark.sql.delta.actions.{Metadata, Protocol}
+import org.apache.spark.sql.delta.metering.DeltaLogging
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.unsafe.types.{CalendarInterval, UTF8String}
 
@@ -383,5 +382,35 @@ object DeltaConfigs extends DeltaLogging {
     _.toBoolean,
     _ => true,
     "needs to be a boolean.")
+
+  val ID_COLS = buildConfig[Seq[String]](
+    s"idCols",
+    "",
+    a => {
+      a.split(",").map(_.trim).filter(_.nonEmpty).sorted.toSeq
+    },
+    _ => true,
+    "needs to be a nonEmpty and with comma separated")
+
+  val ENABLE_BLOOM_FILTER = buildConfig[Boolean](
+    s"enableBloomFilter",
+    "false",
+    a => a.toBoolean,
+    a => true,
+    "needs to be a boolean")
+
+  val BLOOM_FILTER_ERROR_RATE = buildConfig[Double](
+    s"bloomFilterErrorRate",
+    "0.001",
+    a => a.toDouble,
+    a => true,
+    "needs to be a double")
+
+  val BLOOM_FILTER_LOCATION = buildConfig[String](
+    s"bloomFilterLocation",
+    "",
+    x => x,
+    a => true,
+    "needs to be a system bloom filter file")
 
 }
